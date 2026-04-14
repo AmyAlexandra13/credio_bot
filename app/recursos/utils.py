@@ -1,15 +1,15 @@
 Environment = {
-    # Definir el modelo más ligero posible para respuestas rápidas
-    "modelo": "llama3.2:1b",
+    # Definir el modelo que utilizaremos en la nube
+    "modelo": "qwen3.5:cloud",
     
-    # Opciones optimizadas de Ollama para acelerar tiempo de inferencia
+    # Opciones de inferencia
     "ollama_options": {
-        "num_predict": 100,    # Límite muy estricto de palabras a generar (< 2 oraciones)
-        "temperature": 0.0,    # 0.0 hace que no tenga que "deliberar" creatividad y responda inmediato
-        "top_p": 0.5,
-        "num_ctx": 2048,       # Corta el límite de memoria del modelo para alivianar CPU/GPU
-        "num_thread": 8        # Fuerza el uso multihilo de la CPU (muy útil si no tienes GPU dedicada)
+        "num_predict": 1000,   # Aumentado para permitir que procese su bloque "thinking"
+        "top_p": 0.8,
+        "num_ctx": 4096
     },
     
-    "ollama_url": "http://localhost:11434"
+    # Proveedor Oficial de Ollama Cloud
+    "ollama_url": "https://ollama.com",
+    "ollama_api_key": "729756f5e3664c70a01f8ef6befeecab.1CoO5PvIhAxKMzpQQpsw6iy_"
 }
