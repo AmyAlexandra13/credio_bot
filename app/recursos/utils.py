@@ -1,11 +1,9 @@
 Environment = {
-    # Definir el modelo que utilizaremos en la nube
-    "modelo": "qwen3.5:cloud",
+    # Definir el modelo soportado por la Nube de Ollama (Especificando la variante ligera)
+    "ollama_model": "ministral-3:3b-cloud",
     
-    # Opciones de inferencia
+    # Opciones de inferencia (vaciaste para que el Cloud decida lo óptimo)
     "ollama_options": {
-        "num_predict": 1000,   # Aumentado para permitir que procese su bloque "thinking"
-        "top_p": 0.8,
         "num_ctx": 4096
     },
     
