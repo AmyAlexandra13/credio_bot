@@ -1,20 +1,76 @@
+"""
+Router de WhatsApp — Chatbot conversacional SGCC / Credio
+---------------------------------------------------------
+Estados por sesión (SESSIONS[numero]):
+  - "menu"        → Mostrando menú inicial
+  - "sgcc_chat"   → Preguntas sobre el documento SGCC
+  - "awaiting_id" → Esperando cédula para consultar pagos
+"""
+
+import os
+import traceback
+from functools import lru_cache
+from pypdf import PdfReader
 from fastapi import APIRouter, Request, HTTPException, Query
 from app.services.whatsapp_service import WhatsAppService
 from app.services.ollama_service import OllamaService
+from app.services.lending_service import LendingService
 from app.recursos.utils import Environment
-import os
-from functools import lru_cache
-from pypdf import PdfReader
 
 router = APIRouter(prefix="/whatsapp", tags=["whatsapp"])
 
-# Historial de conversaciones por número de teléfono
-CONVERSATIONS = {}
+# ── Estado de conversaciones en memoria ──────────────────────────────────────
+# { numero: { "state": str, "history": list, "name": str } }
+SESSIONS: dict[str, dict] = {}
+
+# ── Textos del bot ────────────────────────────────────────────────────────────
+WELCOME_MESSAGE = (
+    "👋 ¡Hola{name}! Bienvenido al asistente virtual del *SGCC*\n"
+    "_(Sistema Integral de Gestión de Créditos y Cobranza)_\n\n"
+    "¿En qué puedo ayudarte hoy? Elige una opción:\n\n"
+    "  *1* — Consultar información sobre el proyecto SGCC\n"
+    "  *2* — Ver mis próximos pagos\n\n"
+    "Responde con el número de la opción. 😊"
+)
+
+MENU_REMINDER = (
+    "Elige una opción para continuar:\n\n"
+    "  *1* — Consultar información sobre el proyecto SGCC\n"
+    "  *2* — Ver mis próximos pagos\n\n"
+    "_(Escribe *menu* en cualquier momento para volver aquí)_"
+)
+
+SGCC_INTRO = (
+    "📄 *Modo: Información del SGCC*\n\n"
+    "Puedes hacerme cualquier pregunta sobre el proyecto. "
+    "Responderé únicamente basándome en la documentación oficial.\n\n"
+    "_(Escribe *menu* para volver al inicio)_"
+)
+
+ASK_IDENTITY = (
+    "🔍 *Consulta de pagos*\n\n"
+    "Por favor, escribe tu *número de cédula o documento de identidad* "
+    "para buscar tus préstamos activos.\n\n"
+    "_(Escribe *menu* para cancelar)_"
+)
+
+ERROR_AUTH = (
+    "❌ Ocurrió un problema al conectar con nuestro sistema de pagos. "
+    "Por favor intenta más tarde o comunícate con tu asesor."
+)
+
+ERROR_PAYMENTS = (
+    "⚠️ No pude obtener información de pagos para ese documento. "
+    "Verifica que el número sea correcto o comunícate con tu asesor."
+)
 
 
+# ── Carga del PDF (cacheada) ──────────────────────────────────────────────────
 @lru_cache(maxsize=1)
-def get_pdf_context() -> str:
-    pdf_path = os.path.join(os.path.dirname(__file__), "..", "..", "documento_proyecto.pdf")
+def _get_pdf_context() -> str:
+    pdf_path = os.path.join(
+        os.path.dirname(__file__), "..", "..", "documento_proyecto.pdf"
+    )
     if not os.path.exists(pdf_path):
         return "El documento del proyecto no se encontró."
     try:
@@ -25,42 +81,133 @@ def get_pdf_context() -> str:
         )
         return text[:1500].strip()
     except Exception as e:
-        return f"Error al leer el documento: {e}"
+        print(f"[WhatsApp] Error cargando PDF: {e}")
+        return "Ocurrió un error al leer el documento del proyecto."
 
 
-def build_system_prompt() -> str:
-    pdf_content = get_pdf_context()
-    return f"""Eres un asistente virtual experto cuyo ÚNICO propósito es responder basándote 
-ESTRICTAMENTE en el siguiente documento del proyecto:
+# ── System prompt SGCC ────────────────────────────────────────────────────────
+def _sgcc_system_prompt() -> str:
+    pdf_content = _get_pdf_context()
+    return (
+        "Eres un asistente virtual del proyecto SGCC (Sistema Integral de Gestión de Créditos y Cobranza). "
+        "Tu ÚNICO propósito es responder basándote ESTRICTAMENTE en el siguiente documento:\n\n"
+        "--- INICIO DEL DOCUMENTO (SGCC) ---\n"
+        f"{pdf_content}\n"
+        "--- FIN DEL DOCUMENTO ---\n\n"
+        "REGLAS OBLIGATORIAS:\n"
+        "1. Si la pregunta no está respondida en el documento, responde EXACTAMENTE: "
+        "\"Lo siento, no puedo contestar esa pregunta. Solo hablo sobre los detalles especificados en el documento del SGCC.\"\n"
+        "2. Responde siempre en español, MUY BREVE y DIRECTO (máximo 2 oraciones).\n"
+        "3. No uses markdown con asteriscos ni guiones bajos. Responde en texto plano.\n"
+        "4. No salgas del contexto del documento bajo ninguna circunstancia."
+    )
 
---- INICIO DEL DOCUMENTO (SGCC) ---
-{pdf_content}
---- FIN DEL DOCUMENTO ---
 
-Regla Estricta 1: Si la pregunta no está en el documento, responde EXACTAMENTE:
-"Lo siento, no puedo contestar esa pregunta. Solo hablo sobre el SGCC."
-
-Regla Estricta 2: Responde de manera MUY BREVE (máximo 2 oraciones).
-"""
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def _welcome(name: str = "") -> str:
+    name_str = f", *{name}*" if name else ""
+    return WELCOME_MESSAGE.format(name=name_str)
 
 
-# ─── WEBHOOK VERIFICATION (GET) ───────────────────────────────────────────────
+def _get_or_create_session(number: str, name: str = "") -> dict:
+    if number not in SESSIONS:
+        SESSIONS[number] = {"state": "menu", "history": [], "name": name or ""}
+    return SESSIONS[number]
+
+
+# ── Procesador principal ──────────────────────────────────────────────────────
+def process_message(number: str, body: str, profile_name: str = "") -> str:
+    text = body.strip()
+    text_lower = text.lower()
+
+    session = _get_or_create_session(number, profile_name)
+    state = session["state"]
+
+    # Comando global: volver al menú
+    if text_lower in ("menu", "menú", "inicio", "start", "hola", "hi", "buenas", "hello"):
+        session["state"] = "menu"
+        session["history"] = []
+        return _welcome(session["name"])
+
+    # ── Menú principal ────────────────────────────────────────────────────────
+    if state == "menu":
+        if text == "1":
+            session["state"] = "sgcc_chat"
+            session["history"] = [{"role": "system", "content": _sgcc_system_prompt()}]
+            return SGCC_INTRO
+        elif text == "2":
+            session["state"] = "awaiting_id"
+            return ASK_IDENTITY
+        else:
+            return _welcome(session["name"])
+
+    # ── Chat sobre SGCC ───────────────────────────────────────────────────────
+    elif state == "sgcc_chat":
+        history = session["history"]
+        history.append({"role": "user", "content": text})
+
+        modelo = Environment.get("ollama_model", "qwen3.5:cloud")
+        options = Environment.get("ollama_options", {})
+        response_text = OllamaService.chat(history, model=modelo, options=options)
+
+        if response_text.startswith("Error"):
+            history.pop()
+            return "❌ Ocurrió un error al procesar tu consulta. Por favor intenta de nuevo."
+
+        history.append({"role": "assistant", "content": response_text})
+        return f"{response_text}\n\n_(Escribe *menu* para volver al inicio)_"
+
+    # ── Esperando cédula ──────────────────────────────────────────────────────
+    elif state == "awaiting_id":
+        identity = text.replace("-", "").replace(" ", "")
+
+        if not identity.isdigit() or not (7 <= len(identity) <= 15):
+            return (
+                "⚠️ El número de documento no parece válido. "
+                "Por favor ingresa solo los dígitos de tu cédula.\n\n"
+                "_(Escribe *menu* para cancelar)_"
+            )
+
+        token = LendingService.authenticate()
+        if not token:
+            session["state"] = "menu"
+            return f"{ERROR_AUTH}\n\n{MENU_REMINDER}"
+
+        payments_data = LendingService.get_payments_summary(identity, token)
+        if payments_data is None:
+            session["state"] = "menu"
+            return f"{ERROR_PAYMENTS}\n\n{MENU_REMINDER}"
+
+        payments_msg = LendingService.format_payments_message(payments_data)
+        session["state"] = "menu"
+
+        return (
+            f"Resumen de pagos para documento: {text}\n\n"
+            f"{payments_msg}\n\n"
+            "─────────────────────\n"
+            f"{MENU_REMINDER}"
+        )
+
+    # ── Fallback ──────────────────────────────────────────────────────────────
+    session["state"] = "menu"
+    return _welcome(session["name"])
+
+
+# ── GET: verificación del webhook (Meta) ──────────────────────────────────────
 @router.get("/webhook")
 def verify_webhook(
     hub_mode: str = Query(None, alias="hub.mode"),
     hub_verify_token: str = Query(None, alias="hub.verify_token"),
     hub_challenge: str = Query(None, alias="hub.challenge"),
 ):
-    """Meta llama a este endpoint para verificar el webhook."""
     verify_token = Environment.get("whatsapp_verify_token", "")
-
     if hub_mode == "subscribe" and hub_verify_token == verify_token:
-        return int(hub_challenge)  # Responde con el challenge para confirmar
-
+        print(f"[WhatsApp] Webhook verificado correctamente.")
+        return int(hub_challenge)
     raise HTTPException(status_code=403, detail="Token de verificación inválido")
 
 
-# ─── RECIBIR MENSAJES (POST) ───────────────────────────────────────────────────
+# ── POST: recibir mensajes ────────────────────────────────────────────────────
 @router.post("/webhook")
 async def receive_message(request: Request):
     body = await request.json()
@@ -71,36 +218,43 @@ async def receive_message(request: Request):
         change = entry["changes"][0]["value"]
 
         if "messages" not in change:
-            print("⚠️ No hay mensajes en el payload")
+            print("⚠️ Notificación sin mensaje (probablemente status update), ignorando.")
             return {"status": "ignored"}
 
         message = change["messages"][0]
-        from_number = message["from"]
-        msg_type = message.get("type", "")
-
-        print("👤 Número:", from_number)
-        print("💬 Tipo:", msg_type)
-
-        if msg_type != "text":
-            WhatsAppService.send_message(from_number, "Solo proceso texto 😊")
-            return {"status": "ok"}
-
-        user_text = message["text"]["body"].strip()
-        print("💬 Mensaje:", user_text)
-
-        bot_response = OllamaService.chat(
-            CONVERSATIONS.get(from_number, [{"role": "user", "content": user_text}]),
-            model=Environment.get("ollama_model"),
-            options=Environment.get("ollama_options", {})
+        from_number: str = message["from"]
+        msg_type: str = message.get("type", "")
+        profile_name: str = (
+            change.get("contacts", [{}])[0].get("profile", {}).get("name", "")
         )
 
-        print("🤖 Respuesta bot:", bot_response)
+        print(f"👤 Número: {from_number} | Nombre: {profile_name} | Tipo: {msg_type}")
 
-        result = WhatsAppService.send_message(from_number, bot_response)
-        print("📤 Resultado envío:", result)
+        if msg_type != "text":
+            WhatsAppService.send_message(
+                from_number,
+                "Solo proceso mensajes de texto por el momento. 😊\n\nEscribe *menu* para ver las opciones."
+            )
+            return {"status": "ok"}
+
+        user_text: str = message["text"]["body"]
+
+        print(f"💬 Mensaje: {user_text!r}")
+
+        reply = process_message(from_number, user_text, profile_name)
+        print(f"🤖 Respuesta: {reply!r}")
+
+        result = WhatsAppService.send_message(from_number, reply)
+        print(f"📤 Resultado envío: {result}")
 
         return {"status": "ok"}
 
+    except (KeyError, IndexError) as e:
+        print(f"❌ Error parseando payload: {e}")
+        return {"status": "error", "detail": str(e)}
     except Exception as e:
-        print("❌ ERROR:", str(e))
-        return {"status": "error"}
+        print(f"❌ Error inesperado: {e}")
+
+        traceback.print_exc()
+
+        return {"status": "error", "detail": str(e)}
