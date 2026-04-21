@@ -2,10 +2,11 @@
 Router de WhatsApp — Chatbot conversacional SGCC / Credio
 ---------------------------------------------------------
 Estados por sesión (SESSIONS[numero]):
-  - "menu"              → Mostrando menú inicial
-  - "sgcc_chat"         → Preguntas sobre el documento SGCC
-  - "awaiting_id"       → Esperando cédula para consultar pagos
-  - "awaiting_id_status"→ Esperando cédula para consultar estado de solicitudes
+  - "menu"               → Mostrando menú inicial
+  - "sgcc_chat"          → Preguntas sobre el documento SGCC
+  - "awaiting_id"        → Esperando cédula para consultar pagos
+  - "awaiting_id_status" → Esperando cédula para consultar solicitudes
+  - "awaiting_loan_num"  → Esperando número de préstamo para ver resumen
 """
 
 import os
@@ -21,7 +22,6 @@ from app.recursos.utils import Environment
 router = APIRouter(prefix="/whatsapp", tags=["whatsapp"])
 
 # ── Estado de conversaciones en memoria ──────────────────────────────────────
-# { numero: { "state": str, "history": list, "name": str } }
 SESSIONS: dict[str, dict] = {}
 
 # ── Textos del bot ────────────────────────────────────────────────────────────
@@ -31,7 +31,8 @@ WELCOME_MESSAGE = (
     "¿En qué puedo ayudarte hoy? Elige una opción:\n\n"
     "  *1* — Consultar información sobre el proyecto SGCC\n"
     "  *2* — Ver mis próximos pagos\n"
-    "  *3* — Ver el estado de mis solicitudes\n\n"
+    "  *3* — Ver el estado de mis solicitudes\n"
+    "  *4* — Consultar resumen de un préstamo\n\n"
     "Responde con el número de la opción. 😊"
 )
 
@@ -39,7 +40,8 @@ MENU_REMINDER = (
     "Elige una opción para continuar:\n\n"
     "  *1* — Consultar información sobre el proyecto SGCC\n"
     "  *2* — Ver mis próximos pagos\n"
-    "  *3* — Ver el estado de mis solicitudes\n\n"
+    "  *3* — Ver el estado de mis solicitudes\n"
+    "  *4* — Consultar resumen de un préstamo\n\n"
     "_(Escribe *menu* en cualquier momento para volver aquí)_"
 )
 
@@ -64,24 +66,37 @@ ASK_IDENTITY_STATUS = (
     "_(Escribe *menu* para cancelar)_"
 )
 
+ASK_LOAN_NUMBER = (
+    "🏦 *Consulta de préstamo*\n\n"
+    "Por favor, escribe el *número de préstamo* que deseas consultar "
+    "(solo el número, ejemplo: *1042*).\n\n"
+    "_(Escribe *menu* para cancelar)_"
+)
+
 ERROR_AUTH = (
     "❌ Ocurrió un problema al conectar con nuestro sistema. "
     "Por favor intenta más tarde o comunícate con tu asesor."
 )
-
 ERROR_PAYMENTS = (
     "⚠️ No pude obtener información de pagos para ese documento. "
     "Verifica que el número sea correcto o comunícate con tu asesor."
 )
-
 ERROR_STATUS = (
     "⚠️ No pude obtener el estado de solicitudes para ese documento. "
     "Verifica que el número sea correcto o comunícate con tu asesor."
 )
-
+ERROR_LOAN = (
+    "⚠️ No pude obtener información para ese número de préstamo. "
+    "Verifica que el número sea correcto o comunícate con tu asesor."
+)
 INVALID_DOC = (
     "⚠️ El número de documento no parece válido. "
     "Por favor ingresa solo los dígitos de tu cédula.\n\n"
+    "_(Escribe *menu* para cancelar)_"
+)
+INVALID_LOAN = (
+    "⚠️ El número de préstamo no parece válido. "
+    "Por favor ingresa solo el número (ejemplo: *1042*).\n\n"
     "_(Escribe *menu* para cancelar)_"
 )
 
@@ -106,7 +121,6 @@ def _get_pdf_context() -> str:
         return "Ocurrió un error al leer el documento del proyecto."
 
 
-# ── System prompt SGCC ────────────────────────────────────────────────────────
 def _sgcc_system_prompt() -> str:
     pdf_content = _get_pdf_context()
     return (
@@ -137,18 +151,21 @@ def _get_or_create_session(number: str, name: str = "") -> dict:
 
 
 def _validate_document(text: str) -> str | None:
-    """Limpia y valida el número de documento. Retorna el número limpio o None."""
     identity = text.replace("-", "").replace(" ", "")
     if identity.isdigit() and 7 <= len(identity) <= 15:
         return identity
     return None
 
 
+def _validate_loan_number(text: str) -> str | None:
+    """Valida que sea un número de préstamo (solo dígitos, 1-10 caracteres)."""
+    loan = text.replace(" ", "")
+    if loan.isdigit() and 1 <= len(loan) <= 10:
+        return loan
+    return None
+
+
 def _auth_or_error(session: dict) -> tuple[str | None, str | None]:
-    """
-    Autentica contra el API. Retorna (token, None) si éxito
-    o (None, mensaje_error) si falla.
-    """
     token = LendingService.authenticate()
     if not token:
         session["state"] = "menu"
@@ -182,6 +199,9 @@ def process_message(number: str, body: str, profile_name: str = "") -> str:
         elif text == "3":
             session["state"] = "awaiting_id_status"
             return ASK_IDENTITY_STATUS
+        elif text == "4":
+            session["state"] = "awaiting_loan_num"
+            return ASK_LOAN_NUMBER
         else:
             return _welcome(session["name"])
 
@@ -201,7 +221,7 @@ def process_message(number: str, body: str, profile_name: str = "") -> str:
         history.append({"role": "assistant", "content": response_text})
         return f"{response_text}\n\n_(Escribe *menu* para volver al inicio)_"
 
-    # ── Esperando cédula → consulta de pagos ─────────────────────────────────
+    # ── Esperando cédula → pagos ──────────────────────────────────────────────
     elif state == "awaiting_id":
         identity = _validate_document(text)
         if not identity:
@@ -216,17 +236,11 @@ def process_message(number: str, body: str, profile_name: str = "") -> str:
             session["state"] = "menu"
             return f"{ERROR_PAYMENTS}\n\n{MENU_REMINDER}"
 
-        payments_msg = LendingService.format_payments_message(payments_data)
+        msg = LendingService.format_payments_message(payments_data)
         session["state"] = "menu"
+        return f"Resumen de pagos para documento: {text}\n\n{msg}\n\n─────────────────────\n{MENU_REMINDER}"
 
-        return (
-            f"Resumen de pagos para documento: {text}\n\n"
-            f"{payments_msg}\n\n"
-            "─────────────────────\n"
-            f"{MENU_REMINDER}"
-        )
-
-    # ── Esperando cédula → estado de solicitudes ──────────────────────────────
+    # ── Esperando cédula → solicitudes ────────────────────────────────────────
     elif state == "awaiting_id_status":
         identity = _validate_document(text)
         if not identity:
@@ -241,15 +255,28 @@ def process_message(number: str, body: str, profile_name: str = "") -> str:
             session["state"] = "menu"
             return f"{ERROR_STATUS}\n\n{MENU_REMINDER}"
 
-        status_msg = LendingService.format_application_status_message(status_data)
+        msg = LendingService.format_application_status_message(status_data)
         session["state"] = "menu"
+        return f"Estado de solicitudes para documento: {text}\n\n{msg}\n\n─────────────────────\n{MENU_REMINDER}"
 
-        return (
-            f"Estado de solicitudes para documento: {text}\n\n"
-            f"{status_msg}\n\n"
-            "─────────────────────\n"
-            f"{MENU_REMINDER}"
-        )
+    # ── Esperando número de préstamo ──────────────────────────────────────────
+    elif state == "awaiting_loan_num":
+        loan_number = _validate_loan_number(text)
+        if not loan_number:
+            return INVALID_LOAN
+
+        token, err = _auth_or_error(session)
+        if err:
+            return err
+
+        loan_data = LendingService.get_loan_summary(loan_number, token)
+        if loan_data is None:
+            session["state"] = "menu"
+            return f"{ERROR_LOAN}\n\n{MENU_REMINDER}"
+
+        msg = LendingService.format_loan_summary_message(loan_data)
+        session["state"] = "menu"
+        return f"{msg}\n\n─────────────────────\n{MENU_REMINDER}"
 
     # ── Fallback ──────────────────────────────────────────────────────────────
     session["state"] = "menu"
@@ -280,7 +307,6 @@ async def receive_message(request: Request):
         entry = body["entry"][0]
         change = entry["changes"][0]["value"]
 
-        # Meta envía notificaciones de status de entrega sin "messages"
         if "messages" not in change:
             print("⚠️ Notificación sin mensaje (status update), ignorando.")
             return {"status": "ignored"}

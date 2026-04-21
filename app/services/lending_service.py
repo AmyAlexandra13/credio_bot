@@ -60,9 +60,6 @@ class LendingService:
 
     @staticmethod
     def get_application_status(identity_number: str, token: str) -> dict | None:
-        """
-        Consulta el estado de las solicitudes recientes por número de documento.
-        """
         lending_base_url = Environment.get("lending_base_url")
         url = f"{lending_base_url}/api/v1/bot/applications/status/{identity_number}"
         req = urllib.request.Request(
@@ -83,6 +80,34 @@ class LendingService:
         except Exception as e:
             print(f"[LendingService] Error consultando solicitudes: {e}")
             return None
+
+    @staticmethod
+    def get_loan_summary(loan_number: str, token: str) -> dict | None:
+        """
+        Consulta el resumen general de un préstamo por su número.
+        """
+        lending_base_url = Environment.get("lending_base_url")
+        url = f"{lending_base_url}/api/v1/bot/loans/{loan_number}"
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {token}",
+            },
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(req, context=_ssl_ctx()) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            print(f"[LendingService] Error consultando préstamo: HTTP {e.code} - {e.reason}")
+            print(f"[LendingService] Respuesta: {e.read().decode('utf-8')}")
+            return None
+        except Exception as e:
+            print(f"[LendingService] Error consultando préstamo: {e}")
+            return None
+
+    # ── Formateadores ─────────────────────────────────────────────────────────
 
     @staticmethod
     def format_payments_message(data: dict) -> str:
@@ -134,24 +159,19 @@ class LendingService:
 
     @staticmethod
     def format_application_status_message(data: dict) -> str:
-        """
-        Convierte la lista de solicitudes en un mensaje amigable en español.
-        """
         applications = data.get("data", [])
 
         if not applications:
             return "✅ No encontré solicitudes recientes asociadas a su documento de identidad."
 
-        # Iconos y resumen por estado
         STATUS_ICONS = {
-            "aprobada":   "✅",
-            "rechazada":  "❌",
-            "pendiente":  "⏳",
+            "aprobada":    "✅",
+            "rechazada":   "❌",
+            "pendiente":   "⏳",
             "en revisión": "🔍",
-            "cancelada":  "🚫",
+            "cancelada":   "🚫",
         }
 
-        # Agrupar por estado para el resumen
         resumen: dict[str, int] = {}
         for app in applications:
             estado = app.get("statusName", "Desconocido")
@@ -159,7 +179,6 @@ class LendingService:
 
         lines = [f"📋 Encontré {len(applications)} solicitud(es) reciente(s):\n"]
 
-        # Resumen rápido
         resumen_parts = []
         for estado, cantidad in resumen.items():
             icon = STATUS_ICONS.get(estado.lower(), "📌")
@@ -167,15 +186,13 @@ class LendingService:
         lines.append("Resumen: " + " | ".join(resumen_parts))
         lines.append("")
 
-        # Detalle de cada solicitud (máx. 5 para no saturar el chat)
         MAX_DETALLE = 5
-        for i, app in enumerate(applications[:MAX_DETALLE]):
+        for app in applications[:MAX_DETALLE]:
             codigo = app.get("applicationCode", "N/D")
             monto = app.get("requestedAmount", 0)
             estado = app.get("statusName", "N/D")
             fecha = app.get("lastUpdateDate", "N/D")
             icon = STATUS_ICONS.get(estado.lower(), "📌")
-
             lines.append(
                 f"{icon} {codigo}\n"
                 f"   Monto solicitado: RD$ {monto:,.2f}\n"
@@ -188,3 +205,56 @@ class LendingService:
             lines.append(f"\n...y {restantes} solicitud(es) más.")
 
         return "\n".join(lines)
+
+    @staticmethod
+    def format_loan_summary_message(data: dict) -> str:
+        """
+        Convierte el resumen de un préstamo en un mensaje amigable en español.
+        """
+        loan = data.get("data")
+
+        if not loan:
+            return "⚠️ No encontré información para ese número de préstamo."
+
+        loan_number   = loan.get("loanNumber", "N/D")
+        status        = loan.get("statusName", "N/D")
+        original      = loan.get("originalAmount", 0)
+        balance       = loan.get("currentBalance", 0)
+        next_date     = loan.get("nextPaymentDate", "N/D")
+        next_amount   = loan.get("nextPaymentAmount", 0)
+
+        # Ícono según estado
+        STATUS_ICONS = {
+            "activo":    "🟢",
+            "vencido":   "🔴",
+            "pagado":    "✅",
+            "cancelado": "🚫",
+            "mora":      "⚠️",
+        }
+        status_icon = STATUS_ICONS.get(status.lower(), "📋")
+
+        # Porcentaje pagado
+        pagado = original - balance
+        pct = (pagado / original * 100) if original > 0 else 0
+        barra = _progress_bar(pct)
+
+        lines = [
+            f"🏦 Resumen del Préstamo #{loan_number}",
+            "",
+            f"{status_icon} Estado: {status}",
+            f"💵 Monto original:   RD$ {original:,.2f}",
+            f"📉 Saldo actual:     RD$ {balance:,.2f}",
+            f"✔️  Monto pagado:    RD$ {pagado:,.2f}",
+            f"📊 Progreso: {barra} {pct:.1f}%",
+            "",
+            f"📅 Próximo pago: {next_date}",
+            f"💳 Monto a pagar: RD$ {next_amount:,.2f}",
+        ]
+
+        return "\n".join(lines)
+
+
+def _progress_bar(pct: float, length: int = 10) -> str:
+    """Genera una barra de progreso simple con bloques Unicode."""
+    filled = round(pct / 100 * length)
+    return "█" * filled + "░" * (length - filled)
