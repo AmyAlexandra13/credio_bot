@@ -2,11 +2,13 @@
 Router de WhatsApp — Chatbot conversacional SGCC / Credio
 ---------------------------------------------------------
 Estados por sesión (SESSIONS[numero]):
-  - "menu"               → Mostrando menú inicial
-  - "sgcc_chat"          → Preguntas sobre el documento SGCC
-  - "awaiting_id"        → Esperando cédula para consultar pagos
-  - "awaiting_id_status" → Esperando cédula para consultar solicitudes
-  - "awaiting_loan_num"  → Esperando número de préstamo para ver resumen
+  - "menu"                   → Mostrando menú inicial
+  - "sgcc_chat"              → Preguntas sobre el documento SGCC
+  - "awaiting_id"            → Esperando cédula para consultar pagos
+  - "awaiting_id_status"     → Esperando cédula para consultar solicitudes
+  - "awaiting_loan_num"      → Esperando número de préstamo para ver resumen
+  - "awaiting_email_confirm" → Preguntando si desea recibir el reporte por correo
+  - "awaiting_email_input"   → Esperando que el usuario ingrese su correo
 """
 
 import os
@@ -17,6 +19,7 @@ from fastapi import APIRouter, Request, HTTPException, Query
 from app.services.whatsapp_service import WhatsAppService
 from app.services.ollama_service import OllamaService
 from app.services.lending_service import LendingService
+from app.services.email_service import EmailService, validate_email
 from app.recursos.utils import Environment
 
 router = APIRouter(prefix="/whatsapp", tags=["whatsapp"])
@@ -73,6 +76,20 @@ ASK_LOAN_NUMBER = (
     "_(Escribe *menu* para cancelar)_"
 )
 
+ASK_EMAIL_CONFIRM = (
+    "📬 Tienes más solicitudes que no se muestran aquí.\n\n"
+    "¿Deseas recibir el reporte completo con *todas tus solicitudes* en tu correo electrónico?\n\n"
+    "  *1* — Sí, enviarme el reporte por correo\n"
+    "  *2* — No, gracias\n\n"
+    "_(Escribe *menu* para cancelar)_"
+)
+
+ASK_EMAIL_INPUT = (
+    "✉️ Por favor, escribe tu *dirección de correo electrónico* "
+    "y te enviaremos el reporte completo.\n\n"
+    "_(Escribe *menu* para cancelar)_"
+)
+
 ERROR_AUTH = (
     "❌ Ocurrió un problema al conectar con nuestro sistema. "
     "Por favor intenta más tarde o comunícate con tu asesor."
@@ -99,7 +116,11 @@ INVALID_LOAN = (
     "Por favor ingresa solo el número (ejemplo: *1042*).\n\n"
     "_(Escribe *menu* para cancelar)_"
 )
-
+INVALID_EMAIL = (
+    "⚠️ Ese correo no parece válido. Por favor verifica el formato "
+    "(ejemplo: *tunombre@correo.com*) e inténtalo de nuevo.\n\n"
+    "_(Escribe *menu* para cancelar)_"
+)
 
 # ── Carga del PDF (cacheada) ──────────────────────────────────────────────────
 @lru_cache(maxsize=1)
@@ -146,7 +167,14 @@ def _welcome(name: str = "") -> str:
 
 def _get_or_create_session(number: str, name: str = "") -> dict:
     if number not in SESSIONS:
-        SESSIONS[number] = {"state": "menu", "history": [], "name": name or ""}
+        SESSIONS[number] = {
+            "state": "menu",
+            "history": [],
+            "name": name or "",
+            # Campos temporales para el flujo de correo
+            "pending_status_data": None,   # dict con la respuesta de get_application_status
+            "pending_identity": None,      # cédula usada en la consulta
+        }
     return SESSIONS[number]
 
 
@@ -158,7 +186,6 @@ def _validate_document(text: str) -> str | None:
 
 
 def _validate_loan_number(text: str) -> str | None:
-    """Valida que sea un número de préstamo (solo dígitos, 1-10 caracteres)."""
     loan = text.replace(" ", "")
     if loan.isdigit() and 1 <= len(loan) <= 10:
         return loan
@@ -185,6 +212,8 @@ def process_message(number: str, body: str, profile_name: str = "") -> str:
     if text_lower in ("menu", "menú", "inicio", "start", "hola", "hi", "buenas", "hello"):
         session["state"] = "menu"
         session["history"] = []
+        session["pending_status_data"] = None
+        session["pending_identity"] = None
         return _welcome(session["name"])
 
     # ── Menú principal ────────────────────────────────────────────────────────
@@ -255,9 +284,90 @@ def process_message(number: str, body: str, profile_name: str = "") -> str:
             session["state"] = "menu"
             return f"{ERROR_STATUS}\n\n{MENU_REMINDER}"
 
+        applications = status_data.get("data", [])
+
+        MAX_DETALLE = 3
+
         msg = LendingService.format_application_status_message(status_data)
+
+        # Si hay más solicitudes de las que se muestran, ofrecer envío por correo
+        if len(applications) > MAX_DETALLE:
+            session["state"] = "awaiting_email_confirm"
+            session["pending_status_data"] = status_data
+            session["pending_identity"] = identity
+            return (
+                f"Estado de solicitudes para documento: {text}\n\n"
+                f"{msg}\n\n"
+                f"─────────────────────\n"
+                f"{ASK_EMAIL_CONFIRM}"
+            )
+
+        # Si no hay más, flujo normal
         session["state"] = "menu"
-        return f"Estado de solicitudes para documento: {text}\n\n{msg}\n\n─────────────────────\n{MENU_REMINDER}"
+        return (
+            f"Estado de solicitudes para documento: {text}\n\n"
+            f"{msg}\n\n"
+            f"─────────────────────\n"
+            f"{MENU_REMINDER}"
+        )
+
+    # ── Confirmación de envío por correo ──────────────────────────────────────
+    elif state == "awaiting_email_confirm":
+        if text == "1":
+            session["state"] = "awaiting_email_input"
+            return ASK_EMAIL_INPUT
+        elif text == "2":
+            session["state"] = "menu"
+            session["pending_status_data"] = None
+            session["pending_identity"] = None
+            return f"De acuerdo, no se enviará ningún correo. 😊\n\n─────────────────────\n{MENU_REMINDER}"
+        else:
+            # Respuesta no reconocida: repetir la pregunta
+            return (
+                "Por favor responde *1* para recibir el correo o *2* para no recibirlo.\n\n"
+                f"{ASK_EMAIL_CONFIRM}"
+            )
+
+    # ── Recibir e-mail del usuario ────────────────────────────────────────────
+    elif state == "awaiting_email_input":
+        email = text.strip()
+
+        if not validate_email(email):
+            return INVALID_EMAIL
+
+        # Recuperar datos guardados
+        status_data = session.get("pending_status_data")
+        identity    = session.get("pending_identity", "N/D")
+
+        if not status_data:
+            # Datos perdidos por algún motivo
+            session["state"] = "menu"
+            return (
+                "⚠️ Lo sentimos, los datos de tu consulta ya no están disponibles. "
+                "Por favor realiza la consulta nuevamente.\n\n"
+                f"─────────────────────\n{MENU_REMINDER}"
+            )
+
+        # Enviar correo
+        success = EmailService.send_application_status(email, identity, status_data)
+
+        # Limpiar datos temporales
+        session["pending_status_data"] = None
+        session["pending_identity"]    = None
+        session["state"]               = "menu"
+
+        if success:
+            return (
+                f"✅ ¡Listo! Te hemos enviado el reporte completo a *{email}*.\n"
+                "Revisa también tu carpeta de spam si no lo ves en unos minutos.\n\n"
+                f"─────────────────────\n{MENU_REMINDER}"
+            )
+        else:
+            return (
+                f"❌ Ocurrió un error al enviar el correo a *{email}*. "
+                "Por favor verifica la dirección o intenta más tarde.\n\n"
+                f"─────────────────────\n{MENU_REMINDER}"
+            )
 
     # ── Esperando número de préstamo ──────────────────────────────────────────
     elif state == "awaiting_loan_num":

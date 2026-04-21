@@ -186,7 +186,8 @@ class LendingService:
         lines.append("Resumen: " + " | ".join(resumen_parts))
         lines.append("")
 
-        MAX_DETALLE = 5
+        MAX_DETALLE = 3
+
         for app in applications[:MAX_DETALLE]:
             codigo = app.get("applicationCode", "N/D")
             monto = app.get("requestedAmount", 0)
