@@ -2,9 +2,10 @@
 Router de WhatsApp — Chatbot conversacional SGCC / Credio
 ---------------------------------------------------------
 Estados por sesión (SESSIONS[numero]):
-  - "menu"        → Mostrando menú inicial
-  - "sgcc_chat"   → Preguntas sobre el documento SGCC
-  - "awaiting_id" → Esperando cédula para consultar pagos
+  - "menu"              → Mostrando menú inicial
+  - "sgcc_chat"         → Preguntas sobre el documento SGCC
+  - "awaiting_id"       → Esperando cédula para consultar pagos
+  - "awaiting_id_status"→ Esperando cédula para consultar estado de solicitudes
 """
 
 import os
@@ -29,14 +30,16 @@ WELCOME_MESSAGE = (
     "_(Sistema Integral de Gestión de Créditos y Cobranza)_\n\n"
     "¿En qué puedo ayudarte hoy? Elige una opción:\n\n"
     "  *1* — Consultar información sobre el proyecto SGCC\n"
-    "  *2* — Ver mis próximos pagos\n\n"
+    "  *2* — Ver mis próximos pagos\n"
+    "  *3* — Ver el estado de mis solicitudes\n\n"
     "Responde con el número de la opción. 😊"
 )
 
 MENU_REMINDER = (
     "Elige una opción para continuar:\n\n"
     "  *1* — Consultar información sobre el proyecto SGCC\n"
-    "  *2* — Ver mis próximos pagos\n\n"
+    "  *2* — Ver mis próximos pagos\n"
+    "  *3* — Ver el estado de mis solicitudes\n\n"
     "_(Escribe *menu* en cualquier momento para volver aquí)_"
 )
 
@@ -47,21 +50,39 @@ SGCC_INTRO = (
     "_(Escribe *menu* para volver al inicio)_"
 )
 
-ASK_IDENTITY = (
+ASK_IDENTITY_PAYMENTS = (
     "🔍 *Consulta de pagos*\n\n"
     "Por favor, escribe tu *número de cédula o documento de identidad* "
     "para buscar tus préstamos activos.\n\n"
     "_(Escribe *menu* para cancelar)_"
 )
 
+ASK_IDENTITY_STATUS = (
+    "📋 *Consulta de solicitudes*\n\n"
+    "Por favor, escribe tu *número de cédula o documento de identidad* "
+    "para ver el estado de tus solicitudes recientes.\n\n"
+    "_(Escribe *menu* para cancelar)_"
+)
+
 ERROR_AUTH = (
-    "❌ Ocurrió un problema al conectar con nuestro sistema de pagos. "
+    "❌ Ocurrió un problema al conectar con nuestro sistema. "
     "Por favor intenta más tarde o comunícate con tu asesor."
 )
 
 ERROR_PAYMENTS = (
     "⚠️ No pude obtener información de pagos para ese documento. "
     "Verifica que el número sea correcto o comunícate con tu asesor."
+)
+
+ERROR_STATUS = (
+    "⚠️ No pude obtener el estado de solicitudes para ese documento. "
+    "Verifica que el número sea correcto o comunícate con tu asesor."
+)
+
+INVALID_DOC = (
+    "⚠️ El número de documento no parece válido. "
+    "Por favor ingresa solo los dígitos de tu cédula.\n\n"
+    "_(Escribe *menu* para cancelar)_"
 )
 
 
@@ -115,6 +136,26 @@ def _get_or_create_session(number: str, name: str = "") -> dict:
     return SESSIONS[number]
 
 
+def _validate_document(text: str) -> str | None:
+    """Limpia y valida el número de documento. Retorna el número limpio o None."""
+    identity = text.replace("-", "").replace(" ", "")
+    if identity.isdigit() and 7 <= len(identity) <= 15:
+        return identity
+    return None
+
+
+def _auth_or_error(session: dict) -> tuple[str | None, str | None]:
+    """
+    Autentica contra el API. Retorna (token, None) si éxito
+    o (None, mensaje_error) si falla.
+    """
+    token = LendingService.authenticate()
+    if not token:
+        session["state"] = "menu"
+        return None, f"{ERROR_AUTH}\n\n{MENU_REMINDER}"
+    return token, None
+
+
 # ── Procesador principal ──────────────────────────────────────────────────────
 def process_message(number: str, body: str, profile_name: str = "") -> str:
     text = body.strip()
@@ -137,7 +178,10 @@ def process_message(number: str, body: str, profile_name: str = "") -> str:
             return SGCC_INTRO
         elif text == "2":
             session["state"] = "awaiting_id"
-            return ASK_IDENTITY
+            return ASK_IDENTITY_PAYMENTS
+        elif text == "3":
+            session["state"] = "awaiting_id_status"
+            return ASK_IDENTITY_STATUS
         else:
             return _welcome(session["name"])
 
@@ -157,21 +201,15 @@ def process_message(number: str, body: str, profile_name: str = "") -> str:
         history.append({"role": "assistant", "content": response_text})
         return f"{response_text}\n\n_(Escribe *menu* para volver al inicio)_"
 
-    # ── Esperando cédula ──────────────────────────────────────────────────────
+    # ── Esperando cédula → consulta de pagos ─────────────────────────────────
     elif state == "awaiting_id":
-        identity = text.replace("-", "").replace(" ", "")
+        identity = _validate_document(text)
+        if not identity:
+            return INVALID_DOC
 
-        if not identity.isdigit() or not (7 <= len(identity) <= 15):
-            return (
-                "⚠️ El número de documento no parece válido. "
-                "Por favor ingresa solo los dígitos de tu cédula.\n\n"
-                "_(Escribe *menu* para cancelar)_"
-            )
-
-        token = LendingService.authenticate()
-        if not token:
-            session["state"] = "menu"
-            return f"{ERROR_AUTH}\n\n{MENU_REMINDER}"
+        token, err = _auth_or_error(session)
+        if err:
+            return err
 
         payments_data = LendingService.get_payments_summary(identity, token)
         if payments_data is None:
@@ -184,6 +222,31 @@ def process_message(number: str, body: str, profile_name: str = "") -> str:
         return (
             f"Resumen de pagos para documento: {text}\n\n"
             f"{payments_msg}\n\n"
+            "─────────────────────\n"
+            f"{MENU_REMINDER}"
+        )
+
+    # ── Esperando cédula → estado de solicitudes ──────────────────────────────
+    elif state == "awaiting_id_status":
+        identity = _validate_document(text)
+        if not identity:
+            return INVALID_DOC
+
+        token, err = _auth_or_error(session)
+        if err:
+            return err
+
+        status_data = LendingService.get_application_status(identity, token)
+        if status_data is None:
+            session["state"] = "menu"
+            return f"{ERROR_STATUS}\n\n{MENU_REMINDER}"
+
+        status_msg = LendingService.format_application_status_message(status_data)
+        session["state"] = "menu"
+
+        return (
+            f"Estado de solicitudes para documento: {text}\n\n"
+            f"{status_msg}\n\n"
             "─────────────────────\n"
             f"{MENU_REMINDER}"
         )
@@ -202,7 +265,7 @@ def verify_webhook(
 ):
     verify_token = Environment.get("whatsapp_verify_token", "")
     if hub_mode == "subscribe" and hub_verify_token == verify_token:
-        print(f"[WhatsApp] Webhook verificado correctamente.")
+        print("[WhatsApp] Webhook verificado correctamente.")
         return int(hub_challenge)
     raise HTTPException(status_code=403, detail="Token de verificación inválido")
 
@@ -217,8 +280,9 @@ async def receive_message(request: Request):
         entry = body["entry"][0]
         change = entry["changes"][0]["value"]
 
+        # Meta envía notificaciones de status de entrega sin "messages"
         if "messages" not in change:
-            print("⚠️ Notificación sin mensaje (probablemente status update), ignorando.")
+            print("⚠️ Notificación sin mensaje (status update), ignorando.")
             return {"status": "ignored"}
 
         message = change["messages"][0]
@@ -238,7 +302,6 @@ async def receive_message(request: Request):
             return {"status": "ok"}
 
         user_text: str = message["text"]["body"]
-
         print(f"💬 Mensaje: {user_text!r}")
 
         reply = process_message(from_number, user_text, profile_name)
@@ -254,7 +317,5 @@ async def receive_message(request: Request):
         return {"status": "error", "detail": str(e)}
     except Exception as e:
         print(f"❌ Error inesperado: {e}")
-
         traceback.print_exc()
-
         return {"status": "error", "detail": str(e)}
